@@ -1,0 +1,65 @@
+# .github/workflows/build.yml
+name: build-universal-pd-externals
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  build-macos-universal:
+    runs-on: macos-latest
+    env:
+      PD_VER: "0.55-2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch Pure Data headers
+        run: |
+          set -e
+          curl -L -o pd-src.tar.gz "https://github.com/pure-data/pure-data/archive/refs/tags/${PD_VER}.tar.gz"
+          tar -xzf pd-src.tar.gz
+          echo "PD_INCLUDE=$GITHUB_WORKSPACE/pure-data-${PD_VER}/src" >> $GITHUB_ENV
+
+      - name: Build x86_64
+        run: |
+          set -e
+          mkdir -p build/x86_64
+          make clean || true
+          ARCHFLAGS="-arch x86_64" make PD_INCLUDE="${PD_INCLUDE}"
+          # Move artifacts with arch suffix
+          mv wg_line_tilde~.pd_darwin    build/x86_64/wg_line_tilde~.x86_64.pd_darwin
+          mv wg_scatter_tilde~.pd_darwin build/x86_64/wg_scatter_tilde~.x86_64.pd_darwin
+
+      - name: Build arm64
+        run: |
+          set -e
+          mkdir -p build/arm64
+          make clean || true
+          ARCHFLAGS="-arch arm64" make PD_INCLUDE="${PD_INCLUDE}"
+          mv wg_line_tilde~.pd_darwin    build/arm64/wg_line_tilde~.arm64.pd_darwin
+          mv wg_scatter_tilde~.pd_darwin build/arm64/wg_scatter_tilde~.arm64.pd_darwin
+
+      - name: Create universal binaries (lipo)
+        run: |
+          set -e
+          lipo -create \
+            build/x86_64/wg_line_tilde~.x86_64.pd_darwin \
+            build/arm64/wg_line_tilde~.arm64.pd_darwin \
+            -output wg_line_tilde~.pd_darwin
+          lipo -create \
+            build/x86_64/wg_scatter_tilde~.x86_64.pd_darwin \
+            build/arm64/wg_scatter_tilde~.arm64.pd_darwin \
+            -output wg_scatter_tilde~.pd_darwin
+          # Verify thin slices exist
+          lipo -info wg_line_tilde~.pd_darwin
+          lipo -info wg_scatter_tilde~.pd_darwin
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pd-externals-universal
+          path: |
+            wg_line_tilde~.pd_darwin
+            wg_scatter_tilde~.pd_darwin
