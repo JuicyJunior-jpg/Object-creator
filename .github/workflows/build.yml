@@ -6,11 +6,16 @@ on:
     branches: [ main, master ]
   pull_request:
 
+env:
+  PD_VER: "0.55-2"
+  # If your Makefile & .c files live in a subfolder (e.g. "src"),
+  # change this to "src". Otherwise leave as "."
+  PROJECT_DIR: "."
+
 jobs:
   build-macos-universal:
     runs-on: macos-latest
-    env:
-      PD_VER: "0.55-2"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,25 +28,27 @@ jobs:
           echo "PD_INCLUDE=$GITHUB_WORKSPACE/pure-data-${PD_VER}/src" >> $GITHUB_ENV
 
       - name: Build x86_64
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
-          mkdir -p build/x86_64
-          make clean || true
+          rm -f *.o *.pd_darwin || true
           ARCHFLAGS="-arch x86_64" make PD_INCLUDE="${PD_INCLUDE}"
-          # Move artifacts with arch suffix
+          mkdir -p build/x86_64
           mv wg_line_tilde~.pd_darwin    build/x86_64/wg_line_tilde~.x86_64.pd_darwin
           mv wg_scatter_tilde~.pd_darwin build/x86_64/wg_scatter_tilde~.x86_64.pd_darwin
 
       - name: Build arm64
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
-          mkdir -p build/arm64
-          make clean || true
+          rm -f *.o *.pd_darwin || true
           ARCHFLAGS="-arch arm64" make PD_INCLUDE="${PD_INCLUDE}"
+          mkdir -p build/arm64
           mv wg_line_tilde~.pd_darwin    build/arm64/wg_line_tilde~.arm64.pd_darwin
           mv wg_scatter_tilde~.pd_darwin build/arm64/wg_scatter_tilde~.arm64.pd_darwin
 
       - name: Create universal binaries (lipo)
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
           lipo -create \
@@ -52,7 +59,6 @@ jobs:
             build/x86_64/wg_scatter_tilde~.x86_64.pd_darwin \
             build/arm64/wg_scatter_tilde~.arm64.pd_darwin \
             -output wg_scatter_tilde~.pd_darwin
-          # Verify thin slices exist
           lipo -info wg_line_tilde~.pd_darwin
           lipo -info wg_scatter_tilde~.pd_darwin
 
@@ -61,5 +67,6 @@ jobs:
         with:
           name: pd-externals-universal
           path: |
-            wg_line_tilde~.pd_darwin
-            wg_scatter_tilde~.pd_darwin
+            ${{ env.PROJECT_DIR }}/wg_line_tilde~.pd_darwin
+            ${{ env.PROJECT_DIR }}/wg_scatter_tilde~.pd_darwin
+
