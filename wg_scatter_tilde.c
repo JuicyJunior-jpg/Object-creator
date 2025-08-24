@@ -1,8 +1,7 @@
-/* wg_scatter_tilde.c
-   Implements Pd external: wg_scatter_tilde~  (file outputs: wg_scatter_tilde~.pd_darwin)
-   Setup symbol: wg_scatter_tilde_tilde_setup
-   Optional alias: wg_scatter~
-*/
+// wg_scatter_tilde.c
+// Implements Pd external: wg_scatter_tilde~  (file: wg_scatter_tilde~.pd_darwin)
+// Setup symbol: wg_scatter_tilde_tilde_setup
+// Optional alias: wg_scatter~
 #include "m_pd.h"
 #include <math.h>
 #include <string.h>
@@ -27,6 +26,8 @@ typedef struct _wg_scatter_tilde {
     t_float c_all;   /* [0..1] */
     t_float loss;    /* l in [0..0.99] */
 
+    /* built-in one-sample output delay (z^-1) to break algebraic loop in Pd graph */
+    t_sample *y_prev; /* length N, previous-sample outputs */
 } t_wg_scatter_tilde;
 
 static t_class *wg_scatter_tilde_tilde_class;
@@ -36,7 +37,8 @@ static inline t_float clampf(t_float x, t_float lo, t_float hi) {
     return x < lo ? lo : (x > hi ? hi : x);
 }
 
-/* perform routine: energy-conserving N-port junction with open-circuit disables */
+/* perform routine: energy-conserving N-port junction with open-circuit disables.
+   Outputs are delayed by one sample (y_prev) to ensure graph causality in Pd. */
 static t_int *wg_scatter_tilde_perform(t_int *w) {
     t_wg_scatter_tilde *x = (t_wg_scatter_tilde *)(w[1]);
     int n = (int)(w[2]);
@@ -66,19 +68,25 @@ static t_int *wg_scatter_tilde_perform(t_int *w) {
         t_float p = 0.f;
         if (sumY > 1e-20f) p = sumYa / sumY;
 
+        /* compute current-sample outputs, but write the PREVIOUS sample to the graph */
         for (int k = 0; k < N; ++k) {
-            t_float y = 0.f;
+            t_float y_curr = 0.f;
             if (x->enabled[k]) {
                 t_float a = invecs[k][i];
-                t_float b = 2.f * p - a;
-                t_float c_eff = x->c_override[k] >= 0.f ? clampf(x->c_override[k], 0.f, 1.f)
-                                                        : clampf(x->c_all, 0.f, 1.f);
+                t_float b = 2.f * p - a; /* physical outgoing */
+                t_float c_eff = (x->c_override[k] >= 0.f)
+                                  ? clampf(x->c_override[k], 0.f, 1.f)
+                                  : clampf(x->c_all, 0.f, 1.f);
                 /* y = (1 - l) * ((1 - c)a + c b) */
-                y = (1.f - loss) * ( (1.f - c_eff) * a + c_eff * b );
+                y_curr = (1.f - loss) * ( (1.f - c_eff) * a + c_eff * b );
             } else {
-                y = 0.f; /* open circuit: excluded from sums and outputs zero */
+                y_curr = 0.f; /* open circuit */
             }
-            outvecs[k][i] = y;
+
+            /* write previous sample to output to break algebraic loop */
+            outvecs[k][i] = x->y_prev[k];
+            /* store current for next sample */
+            x->y_prev[k] = y_curr;
         }
     }
 
@@ -139,19 +147,22 @@ static void *wg_scatter_tilde_new(t_symbol *s, int argc, t_atom *argv) {
     /* allocate pointer tables using Pd memory */
     x->invecs  = (t_sample **)getbytes(N * sizeof(t_sample *));
     x->outvecs = (t_sample **)getbytes(N * sizeof(t_sample *));
-    for (int i = 0; i < N; ++i) {
-        x->invecs[i] = NULL;
-        x->outvecs[i] = NULL;
-    }
+    for (int i = 0; i < N; ++i) { x->invecs[i] = NULL; x->outvecs[i] = NULL; }
 
-    /* init states */
+    /* per-port defaults */
     for (int i = 0; i < N; ++i) {
         x->enabled[i] = 1;
         x->Y[i] = 1.f;             /* default Zref ratio = 1 */
         x->c_override[i] = -1.f;   /* <0 means "use global" */
     }
-    x->c_all = 0.f;   /* start at pass-through; user ramps 0→1 for exchange */
-    x->loss = 0.f;
+
+    /* GLOBAL DEFAULTS — hearable by default */
+    x->c_all = 1.f;   /* coupling ON by default */
+    x->loss  = 0.05f; /* gentle junction loss */
+
+    /* built-in 1-sample delay state */
+    x->y_prev = (t_sample *)getbytes(N * sizeof(t_sample));
+    for (int i = 0; i < N; ++i) x->y_prev[i] = 0.f;
 
     /* create signal inlets/outlets
        Leftmost inlet becomes signal via CLASS_MAINSIGNALIN.
@@ -170,6 +181,7 @@ static void *wg_scatter_tilde_new(t_symbol *s, int argc, t_atom *argv) {
 static void wg_scatter_tilde_free(t_wg_scatter_tilde *x) {
     if (x->invecs)  freebytes(x->invecs,  x->N * sizeof(t_sample *));
     if (x->outvecs) freebytes(x->outvecs, x->N * sizeof(t_sample *));
+    if (x->y_prev)  freebytes(x->y_prev,  x->N * sizeof(t_sample));
 }
 
 void wg_scatter_tilde_tilde_setup(void) {
@@ -188,7 +200,8 @@ void wg_scatter_tilde_tilde_setup(void) {
     class_addmethod(wg_scatter_tilde_tilde_class, (t_method)wg_scatter_tilde_impedance_ratio, gensym("impedance_ratio"), A_FLOAT, A_FLOAT, 0);
     class_addmethod(wg_scatter_tilde_tilde_class, (t_method)wg_scatter_tilde_couple_loss, gensym("couple_loss"), A_FLOAT, 0);
 
-    CLASS_MAINSIGNALIN(wg_scatter_tilde_tilde_class, t_wg_scatter_tilde, c_all); /* dummy float field: left inlet is signal */
+    /* leftmost inlet is a signal inlet; we still keep c_all as the CLASS_MAINSIGNALIN float */
+    CLASS_MAINSIGNALIN(wg_scatter_tilde_tilde_class, t_wg_scatter_tilde, c_all);
 
     /* optional alias */
     class_addcreator((t_newmethod)wg_scatter_tilde_new, gensym("wg_scatter~"), A_GIMME, 0);
