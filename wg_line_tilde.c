@@ -1,11 +1,20 @@
+
 /* wg_line_tilde.c
    Implements Pd external: wg_line_tilde~  (file outputs: wg_line_tilde~.pd_darwin)
    Setup symbol: wg_line_tilde_tilde_setup
    Optional alias: wg_line~
+
+   Changes in this version:
+   - "dispersion" knob is now LINEAR: a = 0.8 * knob (0..1), so 0 = none, 1 = extreme.
+   - "nonlinearity" (aka drive) inlet controls amount 0..1. Type is selectable via "nl <symbol>" message.
+     Default NL is "fold" and matches the expression the user requested.
+     Extra NLs: tanh, softclip, hardclip, diode, odd, even, cheby2, bitcrush, rect, sine, wrap
+     Optional parameters via "nlparam <p1> <p2>".
 */
 #include "m_pd.h"
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -28,9 +37,7 @@ static inline t_float ap1(t_float x, t_float *z1, t_float a) {
     return y;
 }
 
-/* 4-point (3rd-order) Lagrange interpolation
-   Uses x[-1], x[0], x[1], x[2] around integer index with fractional mu in [0,1).
-*/
+/* 4-point (3rd-order) Lagrange interpolation */
 static inline t_float lagrange4(t_float xm1, t_float x0, t_float x1, t_float x2, t_float mu) {
     t_float c_m1 = -(mu) * (mu - 1.f) * (mu - 2.f) / 6.f;
     t_float c_0  =  (mu + 1.f) * (mu - 1.f) * (mu - 2.f) / 2.f;
@@ -39,20 +46,99 @@ static inline t_float lagrange4(t_float xm1, t_float x0, t_float x1, t_float x2,
     return (c_m1 * xm1) + (c_0 * x0) + (c_1 * x1) + (c_2 * x2);
 }
 
+/* ----- nonlinearities ----- */
+typedef enum {
+    NL_FOLD = 0,
+    NL_TANH,
+    NL_SOFTCLIP,
+    NL_HARDCLIP,
+    NL_DIODE,
+    NL_ODD,
+    NL_EVEN,
+    NL_CHEBY2,
+    NL_BITCRUSH,
+    NL_RECT,
+    NL_SINE,
+    NL_WRAP,
+    NL_COUNT
+} nl_type_e;
+
+/* triangle folding in [-1, +1] similar to:
+   abs((x + 1) - 2 * floor((x + 1)/2)) - 1, but kept in [-1,1]
+*/
+static inline t_float tri_fold(t_float x) {
+    t_float y = x + 1.f;
+    y = y - 2.f * floorf(y * 0.5f); /* wrap to [0,2) */
+    y = fabsf(y - 1.f);             /* triangle in [0,1] */
+    return (y * 2.f) - 1.f;         /* map to [-1,1] */
+}
+
+static inline t_float softclip_cubic(t_float x) {
+    /* "softclip" polynomial: 3x/2 - x^3/2 in [-1,1], hardclip outside */
+    t_float ax = fabsf(x);
+    if (ax >= 1.f) return (x > 0.f) ? 1.f : -1.f;
+    return 1.5f * x - 0.5f * x * x * x;
+}
+
+static inline t_float diode_asym(t_float x, t_float k) {
+    /* asym diode-ish: negative attenuated by (1-k) then softclipped */
+    k = clampf(k, 0.f, 1.f);
+    t_float xn = (x < 0.f) ? x * (1.f - k) : x;
+    return softclip_cubic(xn);
+}
+
+static inline t_float cheby2(t_float x) {
+    /* T2(x) = 2x^2 - 1, keep sign continuity with softclip */
+    t_float y = 2.f * x * x - 1.f;
+    /* softly limit */
+    return softclip_cubic(y);
+}
+
+static inline t_float bitcrush_amp(t_float x, t_float q) {
+    /* amplitude quantize to Q levels in [-1,1] */
+    q = clampf(q, 2.f, 64.f);
+    t_float s = floorf((x * 0.5f + 0.5f) * (q - 1.f) + 0.5f) / (q - 1.f); /* 0..1 */
+    return (s * 2.f) - 1.f;
+}
+
+static inline t_float wrap_sine(t_float x) {
+    /* sin(pi*x) normalized */
+    return sinf((t_float)M_PI * x);
+}
+
+static inline t_float wrap_unit(t_float x) {
+    /* wrap to [-1,1] by fractional saw then map to triangle-like */
+    t_float y = x * 0.5f + 0.5f;        /* map [-1,1] -> [0,1] */
+    y = y - floorf(y);                  /* 0..1 */
+    return (y * 2.f) - 1.f;             /* back to [-1,1] */
+}
+
+static inline t_float halfrect(t_float x) {
+    return (x > 0.f) ? x : 0.f;
+}
+
+/* one-stop shaper (input normalized-ish to about [-1,1]) */
+static inline t_float apply_nl(t_float x, nl_type_e type, t_float p1, t_float p2) {
+    switch (type) {
+        default:
+        case NL_FOLD:      return tri_fold(x);
+        case NL_TANH:      return tanhf(x);
+        case NL_SOFTCLIP:  return softclip_cubic(x);
+        case NL_HARDCLIP:  return (x < -1.f) ? -1.f : (x > 1.f ? 1.f : x);
+        case NL_DIODE:     return diode_asym(x, p1);
+        case NL_ODD:       return x - (x * x * x) * (1.f/3.f);
+        case NL_EVEN:      return copysignf(x*x, x);
+        case NL_CHEBY2:    return cheby2(x);
+        case NL_BITCRUSH:  return bitcrush_amp(x, p1 <= 0.f ? 8.f : (2.f + p1 * 62.f));
+        case NL_RECT:      return (2.f * halfrect(x)) - (x > 0.f ? 0.f : 0.f);
+        case NL_SINE:      return wrap_sine(x);
+        case NL_WRAP:      return wrap_unit(x);
+    }
+}
+
 /* ----- object ----- */
 typedef struct _wg_line_tilde {
     t_object  x_obj;
-
-    /* signal inlets provided via dsp vectors; polarity is a message */
-    t_inlet  *in_freq;
-    t_inlet  *in_couple;
-    t_inlet  *in_feedback;
-    t_inlet  *in_dampAmt;
-    t_inlet  *in_dampFollow;
-    t_inlet  *in_disp;
-    t_inlet  *in_nl;
-    t_inlet  *in_gain;
-    t_inlet  *in_coupleFollow;
 
     t_outlet *out_main;
     t_outlet *out_couple;
@@ -80,16 +166,23 @@ typedef struct _wg_line_tilde {
     t_float last_f0_reported;
     t_float polarity_sign;  /* -1 (negative), +1 (positive); default -1 */
 
+    /* nonlinearity */
+    nl_type_e nl_type;
+    t_float   nl_p1;
+    t_float   nl_p2;
+
 } t_wg_line_tilde;
 
 /* forward decls */
 static t_class *wg_line_tilde_tilde_class;
 
 static void wg_line_tilde_report(t_wg_line_tilde *x, t_floatarg f);
+static void wg_line_tilde_nl(t_wg_line_tilde *x, t_symbol *s);
+static void wg_line_tilde_nlparam(t_wg_line_tilde *x, t_floatarg p1, t_floatarg p2);
 
 /* resize/prepare buffer (>=120 ms) */
 static void wg_line_tilde_allocbuf(t_wg_line_tilde *x, t_float sr) {
-    int need = (int)ceilf(sr * 0.12f) + 4096; /* headroom to avoid wrap hazards */
+    int need = (int)ceilf(sr * 0.12f) + 4096; /* headroom */
     if (need < 2048) need = 2048;
     if (need != x->bufsize) {
         if (x->buf) freebytes(x->buf, x->bufsize * sizeof(t_sample));
@@ -119,7 +212,7 @@ static t_int *wg_line_tilde_perform(t_int *w) {
     t_sample *in_dampAmt      = (t_sample *)(w[7]);
     t_sample *in_dampFollow   = (t_sample *)(w[8]);
     t_sample *in_disp         = (t_sample *)(w[9]);
-    t_sample *in_nl           = (t_sample *)(w[10]);
+    t_sample *in_drive        = (t_sample *)(w[10]); /* amount 0..1 */
     t_sample *in_gain         = (t_sample *)(w[11]);
     t_sample *in_coupleFollow = (t_sample *)(w[12]);
 
@@ -127,11 +220,8 @@ static t_int *wg_line_tilde_perform(t_int *w) {
     t_sample *out_couple      = (t_sample *)(w[14]);
 
     /* locals */
-    t_float sr = x->sr;
-    t_float inv_sr = x->inv_sr;
     int     N = x->bufsize;
     if (!x->buf || N < 8) {
-        /* safety: zero outputs */
         memset(out_main, 0, n * sizeof(t_sample));
         memset(out_couple, 0, n * sizeof(t_sample));
         return (w + 15);
@@ -149,14 +239,14 @@ static t_int *wg_line_tilde_perform(t_int *w) {
         /* controls per-sample */
         t_float f0 = in_freqHz[i];
         if (!isfinite(f0) || f0 <= 0.f) f0 = 1.f;
-        f0 = clampf(f0, 0.1f, sr * 0.45f); /* avoid silly extremes */
+        f0 = clampf(f0, 0.1f, x->sr * 0.45f); /* avoid extremes */
 
-        /* dispersion mapping (quadratic into stable a<1) */
+        /* dispersion mapping: LINEAR */
         t_float dknob = clampf(in_disp[i], 0.f, 1.f);
-        t_float a = 0.8f * dknob * dknob;
+        t_float a = 0.8f * dknob; /* linear 0..0.8 */
 
         /* group delay of single 1st-order allpass @ omega0 */
-        t_float omega0 = 2.f * (t_float)M_PI * f0 * inv_sr;
+        t_float omega0 = 2.f * (t_float)M_PI * f0 * x->inv_sr;
         t_float cosw = cosf(omega0);
         t_float one_minus_a2 = 1.f - a * a;
         t_float denom = 1.f + a * a - 2.f * a * cosw;
@@ -165,7 +255,7 @@ static t_int *wg_line_tilde_perform(t_int *w) {
         t_float tau_disp = 4.f * tau_ap;
 
         /* target delay and compensated read */
-        t_float D_target = sr / f0;
+        t_float D_target = x->sr / f0;
         t_float D_read_target = D_target - tau_disp;
         if (D_read_target < 1.f) D_read_target = 1.f;
 
@@ -200,12 +290,12 @@ static t_int *wg_line_tilde_perform(t_int *w) {
         y = ap1(y, &z1_2, a);
         y = ap1(y, &z1_3, a);
 
-        /* damping inside the loop via LP/HP split with freq-following cutoff */
+        /* damping: LP/HP split with freq-following cutoff */
         t_float dampFollow = clampf(in_dampFollow[i], 0.f, 1.f);
         t_float base_fc = 1000.f;
         t_float fc = base_fc * (1.f - dampFollow) + f0 * dampFollow;
-        fc = clampf(fc, 20.f, sr * 0.45f);
-        t_float a1 = expf(-2.f * (t_float)M_PI * fc * inv_sr); /* one-pole */
+        fc = clampf(fc, 20.f, x->sr * 0.45f);
+        t_float a1 = expf(-2.f * (t_float)M_PI * fc * x->inv_sr); /* one-pole */
         damp_lp = (1.f - a1) * y + a1 * damp_lp;
         t_float y_hp = y - damp_lp;
 
@@ -223,17 +313,23 @@ static t_int *wg_line_tilde_perform(t_int *w) {
         }
         y = y_lp + y_hp;
 
-        /* cubic nonlinearity with blend */
-        t_float nl = clampf(in_nl[i], 0.f, 1.f);
-        t_float alpha = 0.3f * nl * nl;
-        t_float y_nl = y + alpha * y * y * y;
-        y = (1.f - nl) * y + nl * y_nl;
+        /* ---- nonlinearity block (drive as AMOUNT 0..1) ---- */
+        t_float drive = clampf(in_drive[i], 0.f, 1.f);
+        if (drive > 0.f) {
+            /* normalize a bit to avoid volume = "drive" (not the vibe) */
+            t_float yn = clampf(y, -2.f, 2.f); /* keep sane range for shaping */
+            /* input normalization-ish */
+            t_float xnorm = yn; /* don't pre-gain; type determines shape */
+            t_float y_nl = apply_nl(xnorm, x->nl_type, x->nl_p1, x->nl_p2);
+            /* crossfade dry/wet */
+            y = (1.f - drive) * y + drive * y_nl;
+        }
 
         /* feedback branch */
         t_float fb = clampf(in_feedback[i], 0.f, 0.99f);
-        t_float fb_sample = x->polarity_sign * fb * y;
+        t_float fb_sample = pol * fb * y;
 
-        /* write to buffer: exciter + couple_in + feedbackBranch */
+        /* write to buffer: exciter + couple_in + feedback */
         t_float in_sum = in_exciter[i] + in_couple[i] + fb_sample;
         in_sum = zapgremlins(in_sum);
         x->buf[widx] = in_sum;
@@ -247,9 +343,8 @@ static t_int *wg_line_tilde_perform(t_int *w) {
 
         /* low-shelf tilt for couple_send: emphasize lows by mixing LP(main) */
         t_float cf = clampf(in_coupleFollow[i], 0.f, 1.f);
-        /* shelf cutoff roughly follows pitch for musical behavior */
-        t_float shelf_fc = clampf(0.5f * f0 + 150.f, 30.f, sr * 0.25f);
-        t_float a1s = expf(-2.f * (t_float)M_PI * shelf_fc * inv_sr);
+        t_float shelf_fc = clampf(0.5f * f0 + 150.f, 30.f, x->sr * 0.25f);
+        t_float a1s = expf(-2.f * (t_float)M_PI * shelf_fc * x->inv_sr);
         couple_lp = (1.f - a1s) * main_out + a1s * couple_lp;
         t_float couple_send = (1.f - cf) * main_out + cf * couple_lp;
 
@@ -294,7 +389,7 @@ static void wg_line_tilde_dsp(t_wg_line_tilde *x, t_signal **sp) {
        1: x, 2: n,
        3: exciter~, 4: freqHz~, 5: couple_in~,
        6: feedback, 7: dampAmt, 8: dampFollow,
-       9: dispersion, 10: nonlinearity,
+       9: dispersion, 10: drive (NL amount),
        11: gain, 12: coupleFollow,
        13: main_out~, 14: couple_send~
     */
@@ -307,7 +402,7 @@ static void wg_line_tilde_dsp(t_wg_line_tilde *x, t_signal **sp) {
             sp[4]->s_vec,  /* dampAmt */
             sp[5]->s_vec,  /* dampFollow */
             sp[6]->s_vec,  /* dispersion */
-            sp[7]->s_vec,  /* nonlinearity */
+            sp[7]->s_vec,  /* drive (NL amount) */
             sp[8]->s_vec,  /* gain */
             sp[9]->s_vec,  /* coupleFollow */
             sp[10]->s_vec, /* main_out~ */
@@ -316,7 +411,6 @@ static void wg_line_tilde_dsp(t_wg_line_tilde *x, t_signal **sp) {
 }
 
 /* messages */
-
 static void wg_line_tilde_polarity(t_wg_line_tilde *x, t_floatarg f) {
     /* 1 = negative feedback, 2 = positive; default negative */
     int mode = (int)f;
@@ -332,6 +426,33 @@ static void wg_line_tilde_report(t_wg_line_tilde *x, t_floatarg f) {
     outlet_float(x->out_report, D);
     outlet_float(x->out_report, f0);
     x->last_f0_reported = f0;
+}
+
+static nl_type_e nl_from_symbol(t_symbol *s) {
+    if (!s) return NL_FOLD;
+    const char *n = s->s_name;
+    if (!strcmp(n, "fold")) return NL_FOLD;
+    if (!strcmp(n, "tanh")) return NL_TANH;
+    if (!strcmp(n, "softclip")) return NL_SOFTCLIP;
+    if (!strcmp(n, "hardclip")) return NL_HARDCLIP;
+    if (!strcmp(n, "diode")) return NL_DIODE;
+    if (!strcmp(n, "odd")) return NL_ODD;
+    if (!strcmp(n, "even")) return NL_EVEN;
+    if (!strcmp(n, "cheby2")) return NL_CHEBY2;
+    if (!strcmp(n, "bitcrush")) return NL_BITCRUSH;
+    if (!strcmp(n, "rect") || !strcmp(n, "halfrect")) return NL_RECT;
+    if (!strcmp(n, "sine")) return NL_SINE;
+    if (!strcmp(n, "wrap")) return NL_WRAP;
+    return NL_FOLD;
+}
+
+static void wg_line_tilde_nl(t_wg_line_tilde *x, t_symbol *s) {
+    x->nl_type = nl_from_symbol(s);
+}
+
+static void wg_line_tilde_nlparam(t_wg_line_tilde *x, t_floatarg p1, t_floatarg p2) {
+    x->nl_p1 = (t_float)p1;
+    x->nl_p2 = (t_float)p2;
 }
 
 static void *wg_line_tilde_new(void) {
@@ -351,11 +472,15 @@ static void *wg_line_tilde_new(void) {
     x->last_f0_reported = 0.f;
     x->polarity_sign = -1.f;
 
+    x->nl_type = NL_FOLD; /* default type: FOLD */
+    x->nl_p1 = 0.5f;
+    x->nl_p2 = 0.f;
+
     wg_line_tilde_allocbuf(x, x->sr);
 
     /* create signal inlets: total signals = 10
        Left inlet is exciter~ (implicit via CLASS_MAINSIGNALIN).
-       We add: freqHz~, couple_in~, feedback, dampAmt, dampFollow, dispersion, nonlinearity, gain, coupleFollow
+       We add: freqHz~, couple_in~, feedback, dampAmt, dampFollow, dispersion, drive, gain, coupleFollow
     */
     inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_signal, &s_signal); /* freqHz~       (2) */
     inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_signal, &s_signal); /* couple_in~    (3) */
@@ -363,7 +488,7 @@ static void *wg_line_tilde_new(void) {
     inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_signal, &s_signal); /* dampAmt       (5) */
     inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_signal, &s_signal); /* dampFollow    (6) */
     inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_signal, &s_signal); /* dispersion    (7) */
-    inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_signal, &s_signal); /* nonlinearity  (8) */
+    inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_signal, &s_signal); /* drive amount  (8) */
     inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_signal, &s_signal); /* gain          (9) */
     inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_signal, &s_signal); /* coupleFollow  (10) */
 
@@ -394,6 +519,9 @@ void wg_line_tilde_tilde_setup(void) {
     class_addmethod(wg_line_tilde_tilde_class, (t_method)wg_line_tilde_dsp, gensym("dsp"), A_CANT, 0);
     class_addmethod(wg_line_tilde_tilde_class, (t_method)wg_line_tilde_polarity, gensym("polarity"), A_FLOAT, 0);
     class_addmethod(wg_line_tilde_tilde_class, (t_method)wg_line_tilde_report, gensym("report"), A_DEFFLOAT, 0);
+    /* drive selection and params */
+    class_addmethod(wg_line_tilde_tilde_class, (t_method)wg_line_tilde_nl, gensym("nl"), A_SYMBOL, 0);
+    class_addmethod(wg_line_tilde_tilde_class, (t_method)wg_line_tilde_nlparam, gensym("nlparam"), A_DEFFLOAT, A_DEFFLOAT, 0);
 
     CLASS_MAINSIGNALIN(wg_line_tilde_tilde_class, t_wg_line_tilde, sr); /* dummy float field; left inlet is signal */
 
